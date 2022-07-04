@@ -333,6 +333,148 @@ class YAMLConfigFileParser(ConfigFileParser):
         items = dict(items)
         return yaml.dump(items, default_flow_style=default_flow_style)
 
+    
+class CfgConfigFileParser(ConfigFileParser):
+    """Special parser for ini style with sections names support
+    .. code::
+        # this is a comment
+        ; this is also a comment (.ini style)
+        ---            # lines that start with --- are ignored (yaml style)
+        -------------------
+        [section]      # .ini-style section names are treated prefix for the child parameters keys prefix_key
+
+        # how to specify a key-value pair (all of these are equivalent):
+        name value     # key is case sensitive: "Name" isn't "name"
+        name = value   # (.ini style)  (white space is ignored, so name = value same as name=value)
+        name: value    # (yaml style)
+        --name value   # (argparse style)
+        # how to set a flag arg (eg. arg which has action="store_true")
+        --name
+        name
+        name = True    # "True" and "true" are the same
+
+        # how to specify a list arg (eg. arg which has action="append")
+        fruit = [apple, orange, lemon]
+        indexes = [1, 12, 35 , 40]
+    """
+
+    def serialize(self, items):
+        # see ConfigFileParser.serialize docstring
+        r = StringIO()
+        for key, value in items.items():
+            if isinstance(value, list):
+                # handle special case of lists
+                value = ", ".join(map(str, value))
+            r.write("{} = {}\n".format(key, value))
+        return r.getvalue()
+
+    def get_syntax_description(self):
+        msg = ("Config file syntax allows: key=value, flag=true, stuff=[a,b,c] "
+               "(for details, see syntax at https://goo.gl/R74nmi).")
+        return msg
+
+    @staticmethod
+    def __scalar(self, value=None):
+        """
+            Take return a value[0] if `value` is a list of length 1
+            :param value: any type
+            :return: utf-8 string or input value
+            """
+        if isinstance(value, (list, tuple)):
+            if len(value) == 1:
+                return self.__scalar(value[0])
+            return [self.__scalar(l_val) for l_val in list(value)]
+        if isinstance(value, bytes):
+            try:
+                return str(value, "utf-8")
+            except UnicodeError:
+                return value
+        return value
+
+    def __parse_line(self, line):
+
+        braces = ['"', "'"]
+        lines = re.split(r'[{0}]\s*'.format(''.join(self.p_split)), line, 1)
+        if len(lines) != 2:
+            return None
+        key = lines[0].strip()
+        if len(re.split(self.c_sign + r'\s*', key)) > 1:
+            return None
+        variables = lines[1].strip()
+        # mask values in " or '
+        b1 = False
+        b2 = False
+        val = []
+        part = []
+        for v in variables:
+            if v == '"' and not b2:
+                b1 = not b1
+            if v == "'" and not b1:
+                b2 = not b2
+            if v in self.c_sign and not b1 and not b2:
+                break
+            if v in self.v_split and not b1 and not b2:
+                part = ''.join(part).strip()
+                if part[0] in braces and part[0] == part[-1]:
+                    part = part[1:-1]
+                val.append(part)
+                part = []
+            else:
+                part.append(v)
+        if b1 or b2:
+            raise ConfigFileParserException(
+                'Error parsing line. Brackets sre not consistent in the value: {}'.format(line))
+        if part:
+            part = ''.join(part).strip()
+            if part[0] in braces and part[0] == part[-1]:
+                part = part[1:-1]
+            val.append(part)
+        new = []
+        for v in val:
+            new.append(v)
+        # return [key, val]  # If use it the result will be always a list
+        return [key, self.__scalar(new)]
+
+    def parse(self, stream):
+        # see ConfigFileParser.parse docstring
+        # default header =?
+        # default_header = "default"
+        self.p_split = ['=', ':']
+        self.v_split = [',']
+        self.c_sign = '[#;]'
+        current_header = None
+        known_headers = []
+        ret = OrderedDict()
+        l_prev = None
+        for i, line in enumerate(stream):
+            line = line.strip()
+            if not line or line[0] in ["#", ";"] or line.startswith("---"):
+                continue
+            if line[0] == '[' and line[-1] == ']':  # Header line check
+                if l_prev:
+                    raise ConfigFileParserException(
+                        'Unfinished line before header. {} in {}: \n{}'.format(i, getattr(stream, 'name', 'stream'),
+                                                                               l_prev))
+                current_header = line[1:-1]
+                known_headers.append(current_header)  # need to check for duplicates after
+                continue
+            if str(line).endswith(tuple(self.v_split)):  # Does the line has additional one?
+                if l_prev is not None:
+                    l_prev = l_prev + " " + line
+                else:
+                    l_prev = line
+            else:
+                if l_prev is not None:
+                    line = l_prev + " " + line
+                    l_prev = None
+                res = self.__parse_line(line)
+                if res:
+                    if current_header:
+                        ret["{}_{}".format(current_header, res[0])] = res[1]
+                    else:
+                        ret[res[0]] = res[1]
+        return ret
+
 
 # used while parsing args to keep track of where they came from
 _COMMAND_LINE_SOURCE_KEY = "command_line"
@@ -434,7 +576,7 @@ class ArgumentParser(argparse.ArgumentParser):
 
         # parse the additional args
         if config_file_parser_class is None:
-            self._config_file_parser = DefaultConfigFileParser()
+            self._config_file_parser = CfgConfigFileParser()
         else:
             self._config_file_parser = config_file_parser_class()
 
